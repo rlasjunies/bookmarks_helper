@@ -3,15 +3,25 @@ namespace EdgeBookmarksManager.Web;
 public static class JavaScript
 {
     public static string GetClientScript() => """
+        console.log('=== SCRIPT START ===', new Date().toISOString());
+        console.log('SCRIPT START - Current URL:', window.location.href);
+        console.log('SCRIPT START - Document ready state:', document.readyState);
+        console.log('SCRIPT START - Performance navigation type:', performance.navigation ? performance.navigation.type : 'N/A');
+        
         let allBookmarks = [];
         let filteredBookmarks = [];
         let selectedIndex = -1;
         let lastNavigatedUrl = null;
 
         // Load bookmarks
+        console.log('SCRIPT - About to fetch bookmarks');
         fetch('/api/bookmarks')
-            .then(r => r.json())
+            .then(r => {
+                console.log('SCRIPT - Bookmarks fetch response received');
+                return r.json();
+            })
             .then(data => {
+                console.log('SCRIPT - Bookmarks data parsed, calling restoreFocusState');
                 allBookmarks = flattenBookmarks(data.roots.bookmark_bar.children);
                 filteredBookmarks = [...allBookmarks];
                 restoreFocusState();
@@ -81,7 +91,7 @@ public static class JavaScript
                     visualIndexMap.set(visualIndex, bookmark.originalIndex);
                     
                     html += `
-                        <div class="bookmark ${isSelected}" data-visual-index="${visualIndex}" data-original-index="${bookmark.originalIndex}" data-url="${escapeHtml(bookmark.url)}">
+                        <div class="bookmark ${isSelected}" data-visual-index="${visualIndex}" data-original-index="${bookmark.originalIndex}" data-url="${escapeHtml(bookmark.url)}" tabindex="-1">
                             <div class="bookmark-icon"></div>
                             <div style="flex: 1;">
                                 <div class="url">${escapeHtml(bookmark.name)}</div>
@@ -107,10 +117,48 @@ public static class JavaScript
                 bookmarkElement.addEventListener('click', function() {
                     const url = this.getAttribute('data-url');
                     const originalIndex = parseInt(this.getAttribute('data-original-index'));
+                    console.log('CLICK EVENT - Before click: selectedIndex =', selectedIndex, 'Clicked originalIndex =', originalIndex);
                     if (url) {
                         selectedIndex = originalIndex;
+                        console.log('CLICK EVENT - After setting: selectedIndex =', selectedIndex, 'URL =', url);
+                        updateDisplay(); // Show selection before navigation
                         saveFocusState();
                         window.location.href = url;
+                    }
+                });
+                
+                // Add keyboard navigation support for focused bookmarks
+                bookmarkElement.addEventListener('keydown', function(e) {
+                    const originalIndex = parseInt(this.getAttribute('data-original-index'));
+                    selectedIndex = originalIndex; // Ensure selectedIndex is in sync
+                    
+                    switch(e.key) {
+                        case 'Enter':
+                        case ' ': // Space bar
+                            e.preventDefault();
+                            const url = this.getAttribute('data-url');
+                            if (url) {
+                                saveFocusState();
+                                window.location.href = url;
+                            }
+                            break;
+                            
+                        case 'ArrowDown':
+                        case 'ArrowUp':
+                            // Let the existing arrow navigation handle this
+                            e.preventDefault();
+                            // Trigger the same logic as search input arrow navigation
+                            const searchInput = document.getElementById('searchInput');
+                            const event = new KeyboardEvent('keydown', { key: e.key, bubbles: true });
+                            searchInput.dispatchEvent(event);
+                            break;
+                            
+                        case 'Escape':
+                            e.preventDefault();
+                            selectedIndex = -1;
+                            updateDisplay();
+                            document.getElementById('searchInput').focus();
+                            break;
                     }
                 });
             });
@@ -143,48 +191,80 @@ public static class JavaScript
             setTimeout(() => {
                 const navigationType = getNavigationType();
                 const isBackNavigation = navigationType === 'traverse';
+                console.log('XXXXXX FOCUS RESTORATION - selectedIndex =', selectedIndex, 'isBackNavigation =', isBackNavigation);
                 
                 if (selectedIndex >= 0 && isBackNavigation) {
-                    // Back/forward navigation with restored selection - focus search but keep selection
-                    document.getElementById('searchInput').focus();
-                    console.log('Focus restored after traverse navigation with selection');
+                    // Back/forward navigation with restored selection - focus the selected bookmark
+                    console.log('FOCUS RESTORATION - selectedIndex =', selectedIndex, 'isBackNavigation =', isBackNavigation);
+                    const selectedElement = document.querySelector(`[data-original-index="${selectedIndex}"]`);
+                    if (selectedElement) {
+                        selectedElement.focus();
+                        console.log('FOCUS RESTORATION - Focus set to selected bookmark with originalIndex =', selectedIndex, 'Element found:', !!selectedElement);
+                    } else {
+                        document.getElementById('searchInput').focus();
+                        console.log('FOCUS RESTORATION - Fallback to search input - selected element not found for selectedIndex =', selectedIndex);
+                    }
                 } else {
                     // Fresh load, reload, or push/replace navigation - focus search bar
                     document.getElementById('searchInput').focus();
-                    console.log('Focus set for navigation type:', navigationType);
+                    console.log('FOCUS RESTORATION - Fresh navigation, selectedIndex =', selectedIndex, 'navigationType =', navigationType);
                 }
             }, 150);
         }
 
         function saveFocusState() {
+            console.log('SAVE FOCUS STATE - selectedIndex =', selectedIndex, 'filteredBookmarks.length =', filteredBookmarks.length);
             if (selectedIndex >= 0 && filteredBookmarks[selectedIndex]) {
                 const selectedBookmark = filteredBookmarks[selectedIndex];
                 const searchQuery = document.getElementById('searchInput').value;
+                console.log('SAVE FOCUS STATE - Saving bookmark URL:', selectedBookmark.url, 'searchQuery:', searchQuery);
                 sessionStorage.setItem('bookmarkManagerState', JSON.stringify({
                     selectedUrl: selectedBookmark.url,
                     searchQuery: searchQuery,
                     timestamp: Date.now()
                 }));
+            } else {
+                console.log('SAVE FOCUS STATE - Not saving, invalid selectedIndex or bookmark not found');
             }
         }
 
         function getNavigationType() {
-            // Use only Modern Navigation API
+            // Use Modern Navigation API if available
+            console.log('GET NAVIGATION TYPE - window.navigation exists:', 'navigation' in window);
             if ('navigation' in window && window.navigation.currentEntry) {
-                return window.navigation.currentEntry.navigationType || 'navigate';
+                const navType = window.navigation.currentEntry.navigationType || 'navigate';
+                console.log('GET NAVIGATION TYPE - Modern API result:', navType, 'currentEntry:', window.navigation.currentEntry);
+                return navType;
             }
             
-            // Default to navigate if API not available
+            // Fallback: Check if we have saved state in sessionStorage - if so, assume it's back navigation
+            const saved = sessionStorage.getItem('bookmarkManagerState');
+            if (saved) {
+                try {
+                    const state = JSON.parse(saved);
+                    if (Date.now() - state.timestamp < 30000) {
+                        console.log('GET NAVIGATION TYPE - Fallback: Found recent state, assuming traverse');
+                        return 'traverse';
+                    }
+                } catch (e) {
+                    // Ignore parsing errors
+                }
+            }
+            
+            // Default to navigate if API not available and no saved state
+            console.log('GET NAVIGATION TYPE - Using fallback: navigate');
             return 'navigate';
         }
 
         function restoreFocusState() {
             const navigationType = getNavigationType();
             const isBackNavigation = navigationType === 'traverse';
+            console.log('RESTORE FOCUS STATE - Start: navigationType =', navigationType, 'isBackNavigation =', isBackNavigation);
             
             // Only attempt restoration on back/forward navigation
             if (isBackNavigation) {
                 const saved = sessionStorage.getItem('bookmarkManagerState');
+                console.log('RESTORE FOCUS STATE - SessionStorage state:', saved);
                 if (saved) {
                     try {
                         const state = JSON.parse(saved);
@@ -203,9 +283,12 @@ public static class JavaScript
                             
                             if (state.selectedUrl) {
                                 // Find the bookmark with matching URL
+                                console.log('STATE RESTORATION - Searching for URL:', state.selectedUrl);
                                 const bookmarkIndex = filteredBookmarks.findIndex(b => b.url === state.selectedUrl);
+                                console.log('STATE RESTORATION - Found bookmark at index:', bookmarkIndex, 'in filteredBookmarks.length:', filteredBookmarks.length);
                                 if (bookmarkIndex >= 0) {
                                     selectedIndex = bookmarkIndex;
+                                    console.log('STATE RESTORATION - selectedIndex set to:', selectedIndex);
                                     // Clear the state after successful restoration
                                     sessionStorage.removeItem('bookmarkManagerState');
                                     return; // Selection restored, focus will be handled in handlePostDisplayFocus
@@ -215,9 +298,13 @@ public static class JavaScript
                             sessionStorage.removeItem('bookmarkManagerState');
                         }
                     } catch (e) {
-                        // Ignore parsing errors
+                        console.log('RESTORE FOCUS STATE - Error parsing saved state:', e);
                     }
+                } else {
+                    console.log('RESTORE FOCUS STATE - No saved state found in sessionStorage');
                 }
+            } else {
+                console.log('RESTORE FOCUS STATE - Not back navigation, skipping restore');
             }
             
             // Focus will be handled in handlePostDisplayFocus after display is ready
@@ -284,11 +371,16 @@ public static class JavaScript
                             } else {
                                 // Move to next item in visual order
                                 const currentVisualIndex = container.reverseVisualIndexMap.get(selectedIndex);
+                                console.log('ArrowDown - selectedIndex:', selectedIndex, 'currentVisualIndex:', currentVisualIndex);
                                 if (currentVisualIndex !== undefined) {
-                                    const nextVisualIndex = Math.min(currentVisualIndex + 1, filteredBookmarks.length - 1);
-                                    selectedIndex = container.visualIndexMap.get(nextVisualIndex) || selectedIndex;
+                                    const maxVisualIndex = container.visualIndexMap.size - 1;
+                                    const nextVisualIndex = Math.min(currentVisualIndex + 1, maxVisualIndex);
+                                    const newSelectedIndex = container.visualIndexMap.get(nextVisualIndex);
+                                    console.log('Moving from visual', currentVisualIndex, 'to', nextVisualIndex, 'selectedIndex', selectedIndex, '->', newSelectedIndex);
+                                    selectedIndex = newSelectedIndex || selectedIndex;
                                 } else {
                                     // Fallback: simple increment
+                                    console.log('Using fallback increment');
                                     selectedIndex = Math.min(selectedIndex + 1, filteredBookmarks.length - 1);
                                 }
                             }
@@ -301,6 +393,13 @@ public static class JavaScript
                             }
                         }
                         updateDisplay();
+                        // Focus the newly selected bookmark if it exists
+                        setTimeout(() => {
+                            const newSelectedElement = document.querySelector(`[data-original-index="${selectedIndex}"]`);
+                            if (newSelectedElement && document.activeElement !== document.getElementById('searchInput')) {
+                                newSelectedElement.focus();
+                            }
+                        }, 50);
                     }
                     break;
                     
@@ -315,10 +414,20 @@ public static class JavaScript
                             // Move to previous item in visual order
                             if (container.visualIndexMap && container.reverseVisualIndexMap) {
                                 const currentVisualIndex = container.reverseVisualIndexMap.get(selectedIndex);
+                                console.log('ArrowUp - selectedIndex:', selectedIndex, 'currentVisualIndex:', currentVisualIndex);
                                 if (currentVisualIndex !== undefined && currentVisualIndex > 0) {
                                     const prevVisualIndex = currentVisualIndex - 1;
-                                    selectedIndex = container.visualIndexMap.get(prevVisualIndex) || selectedIndex;
+                                    const newSelectedIndex = container.visualIndexMap.get(prevVisualIndex);
+                                    console.log('Moving from visual', currentVisualIndex, 'to', prevVisualIndex, 'selectedIndex', selectedIndex, '->', newSelectedIndex);
+                                    selectedIndex = newSelectedIndex || selectedIndex;
                                     updateDisplay();
+                                    // Focus the newly selected bookmark if it exists
+                                    setTimeout(() => {
+                                        const newSelectedElement = document.querySelector(`[data-original-index="${selectedIndex}"]`);
+                                        if (newSelectedElement && document.activeElement !== document.getElementById('searchInput')) {
+                                            newSelectedElement.focus();
+                                        }
+                                    }, 50);
                                 } else if (currentVisualIndex === 0) {
                                     // At first item, clear selection
                                     selectedIndex = -1;
@@ -328,6 +437,13 @@ public static class JavaScript
                                     if (selectedIndex > 0) {
                                         selectedIndex = selectedIndex - 1;
                                         updateDisplay();
+                                        // Focus the newly selected bookmark if it exists
+                                        setTimeout(() => {
+                                            const newSelectedElement = document.querySelector(`[data-original-index="${selectedIndex}"]`);
+                                            if (newSelectedElement && document.activeElement !== document.getElementById('searchInput')) {
+                                                newSelectedElement.focus();
+                                            }
+                                        }, 50);
                                     } else {
                                         selectedIndex = -1;
                                         updateDisplay();
@@ -338,6 +454,13 @@ public static class JavaScript
                                 if (selectedIndex > 0) {
                                     selectedIndex = selectedIndex - 1;
                                     updateDisplay();
+                                    // Focus the newly selected bookmark if it exists
+                                    setTimeout(() => {
+                                        const newSelectedElement = document.querySelector(`[data-original-index="${selectedIndex}"]`);
+                                        if (newSelectedElement && document.activeElement !== document.getElementById('searchInput')) {
+                                            newSelectedElement.focus();
+                                        }
+                                    }, 50);
                                 } else {
                                     selectedIndex = -1;
                                     updateDisplay();
@@ -378,5 +501,34 @@ public static class JavaScript
         }
 
         // Focus handling is now done in restoreFocusState()
+        
+        // Additional debugging for page load events
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('EVENT - DOMContentLoaded fired');
+        });
+        
+        window.addEventListener('load', function() {
+            console.log('EVENT - window.load fired');
+        });
+        
+        window.addEventListener('pageshow', function(event) {
+            console.log('EVENT - pageshow fired, persisted:', event.persisted);
+            if (event.persisted) {
+                // Page was restored from cache (back/forward navigation)
+                console.log('PAGESHOW - Page restored from cache, calling restore functions');
+                if (allBookmarks.length > 0) {
+                    // Data already loaded, just restore state
+                    restoreFocusState();
+                    updateDisplay();
+                    handlePostDisplayFocus();
+                } else {
+                    console.log('PAGESHOW - No bookmark data, will be handled by fetch');
+                }
+            }
+        });
+        
+        window.addEventListener('pagehide', function(event) {
+            console.log('EVENT - pagehide fired, persisted:', event.persisted);
+        });
         """;
 }
